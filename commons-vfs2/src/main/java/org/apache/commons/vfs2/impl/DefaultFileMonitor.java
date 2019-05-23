@@ -32,7 +32,8 @@ import org.apache.commons.vfs2.provider.AbstractFileSystem;
 /**
  * A polling {@link FileMonitor} implementation.
  * <p>
- * The DefaultFileMonitor is a Thread based polling file system monitor with a 1 second delay.
+ * The DefaultFileMonitor is a Thread based polling file system monitor with a 1 second delay. Its methods are <b>not</b> thread safe.
+ * </p>
  *
  * <h2>Design:</h2>
  *
@@ -49,9 +50,11 @@ import org.apache.commons.vfs2.provider.AbstractFileSystem;
  * <p>
  * New files are detected during each "check" as each file does a check for new children. If new children are found,
  * create events are fired recursively if recursive descent is enabled.
+ * </p>
  * <p>
  * For performance reasons, added a delay that increases as the number of files monitored increases. The default is a
  * delay of 1 second for every 1000 files processed.
+ * </p>
  *
  * <h2>Example usage:</h2>
  *
@@ -157,27 +160,28 @@ public class DefaultFileMonitor implements Runnable, FileMonitor {
      */
     @Override
     public void addFile(final FileObject file) {
-        synchronized (this.monitorMap) {
-            if (this.monitorMap.get(file.getName()) == null) {
-                this.monitorMap.put(file.getName(), new FileMonitorAgent(this, file));
+        if (this.monitorThread != null) {
+            throw new IllegalStateException("Cannot add files after the monitor has been started");
+        }
 
-                try {
-                    if (this.listener != null) {
-                        file.getFileSystem().addListener(file, this.listener);
-                    }
+        if (this.monitorMap.get(file.getName()) == null) {
+            this.monitorMap.put(file.getName(), new FileMonitorAgent(this, file));
 
-                    if (file.getType().hasChildren() && this.recursive) {
-                        // Traverse the children
-                        final FileObject[] children = file.getChildren();
-                        for (final FileObject element : children) {
-                            this.addFile(element); // Add depth first
-                        }
-                    }
-
-                } catch (final FileSystemException fse) {
-                    LOG.error(fse.getLocalizedMessage(), fse);
+            try {
+                if (this.listener != null) {
+                    file.getFileSystem().addListener(file, this.listener);
                 }
 
+                if (file.getType().hasChildren() && this.recursive) {
+                    // Traverse the children
+                    final FileObject[] children = file.getChildren();
+                    for (final FileObject element : children) {
+                        this.addFile(element); // Add depth first
+                    }
+                }
+
+            } catch (final FileSystemException fse) {
+                LOG.error(fse.getLocalizedMessage(), fse);
             }
         }
     }
@@ -189,23 +193,25 @@ public class DefaultFileMonitor implements Runnable, FileMonitor {
      */
     @Override
     public void removeFile(final FileObject file) {
-        synchronized (this.monitorMap) {
-            final FileName fn = file.getName();
-            if (this.monitorMap.get(fn) != null) {
-                FileObject parent;
-                try {
-                    parent = file.getParent();
-                } catch (final FileSystemException fse) {
-                    parent = null;
-                }
+        if (this.monitorThread != null) {
+            throw new IllegalStateException("Cannot remove files after the monitor has been started");
+        }
 
-                this.monitorMap.remove(fn);
+        final FileName fn = file.getName();
+        if (this.monitorMap.get(fn) != null) {
+            FileObject parent;
+            try {
+                parent = file.getParent();
+            } catch (final FileSystemException fse) {
+                parent = null;
+            }
 
-                if (parent != null) { // Not the root
-                    final FileMonitorAgent parentAgent = this.monitorMap.get(parent.getName());
-                    if (parentAgent != null) {
-                        parentAgent.resetChildrenList();
-                    }
+            this.monitorMap.remove(fn);
+
+            if (parent != null) { // Not the root
+                final FileMonitorAgent parentAgent = this.monitorMap.get(parent.getName());
+                if (parentAgent != null) {
+                    parentAgent.resetChildrenList();
                 }
             }
         }
@@ -304,19 +310,9 @@ public class DefaultFileMonitor implements Runnable, FileMonitor {
     public void run() {
         mainloop: while (!monitorThread.isInterrupted() && this.shouldRun) {
             // For each entry in the map
-            Object[] fileNames;
-            synchronized (this.monitorMap) {
-                fileNames = this.monitorMap.keySet().toArray();
-            }
-            for (int iterFileNames = 0; iterFileNames < fileNames.length; iterFileNames++) {
-                final FileName fileName = (FileName) fileNames[iterFileNames];
-                FileMonitorAgent agent;
-                synchronized (this.monitorMap) {
-                    agent = this.monitorMap.get(fileName);
-                }
-                if (agent != null) {
-                    agent.check();
-                }
+            int iterFileNames = 0;
+            for (FileMonitorAgent agent : this.monitorMap.values()) {
+                agent.check();
 
                 if (getChecksPerRun() > 0 && (iterFileNames + 1) % getChecksPerRun() == 0) {
                     try {
@@ -329,6 +325,8 @@ public class DefaultFileMonitor implements Runnable, FileMonitor {
                 if (monitorThread.isInterrupted() || !this.shouldRun) {
                     continue mainloop;
                 }
+
+                iterFileNames++;
             }
 
             while (!this.addStack.empty()) {
